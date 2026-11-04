@@ -2,7 +2,7 @@ import sys
 import logging
 from pyspark.context import SparkContext
 from pyspark.sql.functions import col, from_json, explode
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, DoubleType
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, DoubleType
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -26,9 +26,15 @@ raw_payloads = [
 
 raw_df = spark.createDataFrame(raw_payloads, ["payload_string"])
 
-# Flawed schema definition: transaction_id is defined as IntegerType instead of StringType
+# Schema definition: transaction_id is StringType to match alphanumeric values such as 'TXN-9821A'.
+# Field reference:
+#   transaction_id: StringType  — e.g. 'TXN-9821A'
+#   amount:         DoubleType  — e.g. 145.50
+#   currency:       StringType  — e.g. 'USD'
+# WARNING: Do NOT declare transaction_id as IntegerType — from_json will silently coerce
+# alphanumeric strings to null, causing all records to fail the downstream null-validation guard.
 nested_item_schema = StructType([
-    StructField("transaction_id", IntegerType(), True),
+    StructField("transaction_id", StringType(), True),
     StructField("amount", DoubleType(), True),
     StructField("currency", StringType(), True)
 ])
@@ -47,7 +53,6 @@ exploded_df = parsed_df.select(
 )
 
 logger.info("Validating strict non-null transaction IDs...")
-# Fails because transaction_id parses as null due to the int cast, throwing Assertion/Filter error
 clean_metrics = exploded_df.select(
     col("batch_id"),
     col("record.transaction_id").alias("tx_id"),
@@ -58,6 +63,8 @@ clean_metrics = exploded_df.select(
 invalid_count = clean_metrics.filter(col("tx_id").isNull()).count()
 if invalid_count > 0:
     logger.error("Data contract violation: Found %s null transaction IDs after cast", invalid_count)
+    logger.error("Affected batch IDs with null transaction_id values:")
+    clean_metrics.filter(col("tx_id").isNull()).select("batch_id").show(truncate=False)
     raise ValueError(f"Corrupted records encountered: {invalid_count} records failed schema validation")
 
 clean_metrics.show()
